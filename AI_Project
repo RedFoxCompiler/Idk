@@ -1,0 +1,601 @@
+"""
+PythonGenerativa5.py
+
+Um script de Inteligência Artificial Generativa avançado e de alta performance.
+Sucessor de PythonGenerativa4.py, focado em eficiência de treinamento de nível profissional,
+estabilidade, estratégias de geração avançadas e métricas de avaliação robustas,
+simulando práticas de treinamento de LLMs reais.
+
+Versão: 0.5 (Gemini Enhanced)
+Data da Melhoria: 2025-06-30
+"""
+
+# ==============================================================================
+#                      CONFIGURAÇÃO E MÓDULOS ESSENCIAIS :rocket:
+# ==============================================================================
+import os
+import json
+import logging
+import shutil
+import math
+import time
+from datetime import datetime
+from collections import Counter
+import re
+
+# Bibliotecas de Machine Learning
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader
+    from torch.optim import Adam
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    from torch.cuda.amp import GradScaler, autocast
+except ImportError:
+    print("Erro: PyTorch não encontrado. Por favor, instale com 'pip install torch'.")
+    exit()
+
+# Utilitários do script :D
+from tqdm import tqdm
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+except ImportError:
+    # Fallback se colorama não estiver instalado
+    class Fore:
+        GREEN = RED = YELLOW = CYAN = MAGENTA = WHITE = ""
+    class Style:
+        BRIGHT = RESET_ALL = ""
+    print("Aviso: 'colorama' não encontrada. A saída não será colorida.")
+
+# --- Configurações Globais ---
+BASE_DIR = "D:/Luna AI/"
+CONFIG = {
+    "corpus_path": os.path.join(BASE_DIR, "corpus/corpus_ai.txt"),
+    "tokenizer_path": os.path.join(BASE_DIR, "tokenizer/tokenizer.json"),
+    "checkpoints_dir": os.path.join(BASE_DIR, "checkpoints/"),
+    "logs_path": os.path.join(BASE_DIR, "logs/training.log"),
+    "progress_path": os.path.join(BASE_DIR, "training/progress.json"),
+    "inference_dir": os.path.join(BASE_DIR, "inference/"),
+    "backups_dir": os.path.join(BASE_DIR, "BackupsM/"),
+    "pipeline_dir": os.path.join(BASE_DIR, "pipeline/"),
+    "old_script_path": os.path.join(BASE_DIR, "PythonGenerativa2.py"),
+    "current_script_path": os.path.abspath(__file__),
+    "best_model_path": os.path.join(BASE_DIR, "checkpoints/best_model.pth"),
+    "latest_model_path": os.path.join(BASE_DIR, "checkpoints/latest_model.pth"),
+}
+
+# --- Parâmetros do Modelo e Treinamento (COM MELHORIAS) ---
+MODEL_PARAMS = {
+    "d_model": 192,
+    "nhead": 6,
+    "num_encoder_layers": 8,
+    "dim_feedforward": 768, # Geralmente 4 * d_model
+    "dropout": 0.15,
+    "vocab_size": 0  # Definido pelo tokenizer
+}
+
+TRAINING_PARAMS = {
+    "max_length": 256,
+    "batch_size": 32,
+    "epochs": 250,
+    "learning_rate": 3e-4,
+    "min_freq_for_vocab": 2,
+    # --- NOVOS PARÂMETROS AVANÇADOS ---
+    "gradient_accumulation_steps": 2, # Simula um batch_size de 32*2=64
+    "clip_grad_norm": 1.0,           # Previne explosão de gradientes
+    "scheduler_patience": 3,         # Épocas sem melhora para reduzir o LR
+    "scheduler_factor": 0.5,         # Fator de redução do LR (LR = LR * 0.5)
+}
+
+GENERATION_PARAMS = {
+    "beam_width": 5,                 # Para Beam Search
+    "top_k": 50,                     # Para Top-K Sampling (não usado no Nucleus, mas aqui para referência)
+    "top_p": 0.92,                   # Para Nucleus Sampling (Top-P)
+}
+
+
+# --- Geração Automática de Prompts com Base no Corpus ---
+def gerar_autotest_prompts(corpus_path, qtd=6):
+    import random
+    if not os.path.exists(corpus_path): return ["Qual o futuro da IA?"] # Fallback
+    with open(corpus_path, 'r', encoding='utf-8') as f:
+        texto = f.read().lower()
+    palavras_chave = re.findall(r'\b(inteligência artificial|aprendizado de máquina|redes neurais|python|dados|nlp|visão computacional|ética|transformers|chatbots|linguagem natural|autoteste|reconhecimento de fala|bias|algoritmos|corpus|tokenização)\b', texto)
+    if not palavras_chave: return ["O que é inteligência artificial?"] # Fallback
+    palavras_chave = list(set(palavras_chave))
+    random.shuffle(palavras_chave)
+    base_perguntas = ["O que é {}?", "Explique {}.", "Qual a função de {}?", "Como funciona {}?", "Por que {} é importante?", "Como a IA usa {}?"]
+    prompts = [random.choice(base_perguntas).format(termo) for termo in palavras_chave[:qtd]]
+    return prompts
+
+AUTOTEST_PROMPTS = gerar_autotest_prompts(CONFIG["corpus_path"], qtd=10)
+FINAL_INFERENCE_PROMPT = "Explique o futuro da inteligência artificial de forma criativa e detalhada"
+
+
+# ==============================================================================
+#             COMPONENTES DE DADOS (TOKENIZER E DATASET) (sem alterações)
+# ==============================================================================
+class CustomTokenizer:
+    def __init__(self, pad_token="<pad>", unk_token="<unk>", sos_token="<s>", eos_token="</s>"):
+        self.pad_token, self.unk_token, self.sos_token, self.eos_token = pad_token, unk_token, sos_token, eos_token
+        self.special_tokens = [pad_token, unk_token, sos_token, eos_token]
+        self.token_to_id, self.id_to_token, self.vocab = {}, {}, []
+
+    def _build_vocab(self, tokens, min_freq):
+        token_counts = Counter(tokens)
+        self.vocab = self.special_tokens + [token for token, count in token_counts.items() if count >= min_freq]
+        self.token_to_id = {token: i for i, token in enumerate(self.vocab)}
+        self.id_to_token = {i: token for i, token in enumerate(self.vocab)}
+        self.pad_id = self.token_to_id[self.pad_token]
+        self.unk_id = self.token_to_id[self.unk_token]
+        self.sos_id = self.token_to_id[self.sos_token]
+        self.eos_id = self.token_to_id[self.eos_token]
+        MODEL_PARAMS["vocab_size"] = len(self.vocab)
+
+    def train(self, corpus_path, min_freq=2):
+        with open(corpus_path, 'r', encoding='utf-8') as f: text = f.read()
+        tokens = re.findall(r'\b\w+\b|[.,!?;]', text.lower())
+        if not tokens: raise ValueError("O corpus está vazio ou não contém tokens válidos.")
+        self._build_vocab(tokens, min_freq)
+
+    def encode(self, text, add_special_tokens=True):
+        tokens = re.findall(r'\b\w+\b|[.,!?;]', text.lower())
+        encoded = [self.token_to_id.get(token, self.unk_id) for token in tokens]
+        if add_special_tokens: encoded = [self.sos_id] + encoded + [self.eos_id]
+        return encoded
+
+    def decode(self, ids, skip_special_tokens=True):
+        tokens = []
+        for i in ids:
+            token = self.id_to_token.get(i, self.unk_token)
+            if skip_special_tokens and token in self.special_tokens: continue
+            tokens.append(token)
+        return " ".join(tokens)
+
+    def save(self, filepath):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        state = {
+            "token_to_id": self.token_to_id,
+            "id_to_token": {str(k): v for k, v in self.id_to_token.items()},
+            "vocab": self.vocab, "special_tokens": self.special_tokens }
+        with open(filepath, 'w', encoding='utf-8') as f: json.dump(state, f, ensure_ascii=False, indent=4)
+
+    def load(self, filepath):
+        with open(filepath, 'r', encoding='utf-8') as f: state = json.load(f)
+        self.token_to_id = state["token_to_id"]
+        self.id_to_token = {int(k): v for k, v in state["id_to_token"].items()}
+        self.vocab, self.special_tokens = state["vocab"], state["special_tokens"]
+        self.pad_token, self.unk_token, self.sos_token, self.eos_token = self.special_tokens
+        self.pad_id, self.unk_id, self.sos_id, self.eos_id = [self.token_to_id.get(t) for t in self.special_tokens]
+        MODEL_PARAMS["vocab_size"] = len(self.vocab)
+
+class TextDataset(Dataset):
+    def __init__(self, corpus_path, tokenizer, max_length):
+        self.tokenizer, self.max_length = tokenizer, max_length
+        with open(corpus_path, 'r', encoding='utf-8') as f: text = f.read()
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+        self.sequences = []
+        for i in range(0, len(tokens) - max_length + 1, max_length):
+            seq = [self.tokenizer.sos_id] + tokens[i:i + max_length - 2] + [self.tokenizer.eos_id]
+            padding_len = max_length - len(seq)
+            if padding_len > 0: seq += [self.tokenizer.pad_id] * padding_len
+            self.sequences.append(seq)
+
+    def __len__(self): return len(self.sequences)
+    def __getitem__(self, idx):
+        seq = torch.tensor(self.sequences[idx], dtype=torch.long)
+        return seq[:-1], seq[1:]
+
+# ==============================================================================
+#                      ARQUITETURA DO MODELO TRANSFORMER (sem alterações)
+# ==============================================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
+
+class SimpleTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model, nhead, num_encoder_layers, dim_feedforward, dropout):
+        super(SimpleTransformer, self).__init__()
+        self.d_model = d_model
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_encoder_layers)
+        self.linear_out = nn.Linear(d_model, vocab_size)
+
+    def _generate_square_subsequent_mask(self, sz, device):
+        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
+    def forward(self, src, src_key_padding_mask=None):
+        sz = src.size(1)
+        src_mask = self._generate_square_subsequent_mask(sz, src.device)
+        src = self.embedding(src) * math.sqrt(self.d_model)
+        src = self.pos_encoder(src)
+        output = self.transformer_encoder(src, mask=src_mask, src_key_padding_mask=src_key_padding_mask)
+        return self.linear_out(output)
+
+# ==============================================================================
+#              MOTOR DE TREINAMENTO E AVALIAÇÃO (VERSÃO TURBO) :fire:
+# ==============================================================================
+class TrainingEngine:
+    def __init__(self):
+        self._setup_logging()
+        self.device = self._get_device()
+        self.tokenizer = CustomTokenizer()
+        self._prepare_tokenizer()
+
+        self.model = SimpleTransformer(**MODEL_PARAMS).to(self.device)
+        self.optimizer = Adam(self.model.parameters(), lr=TRAINING_PARAMS["learning_rate"])
+        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', patience=TRAINING_PARAMS["scheduler_patience"], factor=TRAINING_PARAMS["scheduler_factor"])
+        self.criterion = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_id)
+        self.scaler = GradScaler(enabled=(self.device.type == 'cuda'))
+        
+        self.progress = {"best_perplexity": float('inf'), "epochs": [], "current_lr": TRAINING_PARAMS["learning_rate"]}
+        self.start_epoch = 0
+        self._load_checkpoint()
+
+        param_count = sum(p.numel() for p in self.model.parameters())
+        logging.info(f"Modelo SimpleTransformer inicializado com {param_count:,} parâmetros.")
+        print(Fore.GREEN + f"Modelo pronto com {param_count:,} parâmetros.")
+
+    def _get_device(self):
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            logging.info(f"Dispositivo CUDA selecionado: {torch.cuda.get_device_name(0)}")
+            print(Fore.GREEN + f"Dispositivo CUDA selecionado: {torch.cuda.get_device_name(0)}")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+            logging.info("Dispositivo Apple Metal (MPS) selecionado.")
+            print(Fore.GREEN + "Dispositivo Apple Metal (MPS) selecionado.")
+        else:
+            device = torch.device("cpu")
+            cpu_cores = os.cpu_count()
+            msg = f"Nenhum dispositivo GPU encontrado. Usando CPU com {cpu_cores} núcleos."
+            logging.warning(msg)
+            print(Fore.YELLOW + msg)
+            if cpu_cores <= 4:
+                warn_msg = "Aviso: Sua CPU tem 4 ou menos núcleos. O treinamento será extremamente lento."
+                logging.warning(warn_msg)
+                print(Fore.RED + Style.BRIGHT + warn_msg)
+        return device
+
+    def _setup_logging(self):
+        os.makedirs(os.path.dirname(CONFIG["logs_path"]), exist_ok=True)
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                            handlers=[logging.FileHandler(CONFIG["logs_path"]), logging.StreamHandler()])
+
+    def _prepare_tokenizer(self):
+        if os.path.exists(CONFIG["tokenizer_path"]):
+            logging.info(f"Carregando tokenizer de {CONFIG['tokenizer_path']}")
+            self.tokenizer.load(CONFIG["tokenizer_path"])
+        else:
+            logging.info("Tokenizer não encontrado. Treinando um novo a partir do corpus...")
+            if not os.path.exists(CONFIG["corpus_path"]) or os.path.getsize(CONFIG["corpus_path"]) == 0:
+                logging.error(f"FATAL: Arquivo de corpus '{CONFIG['corpus_path']}' vazio ou não existe.")
+                raise FileNotFoundError("Corpus para treinamento do tokenizer não encontrado ou vazio.")
+            self.tokenizer.train(CONFIG["corpus_path"], min_freq=TRAINING_PARAMS["min_freq_for_vocab"])
+            self.tokenizer.save(CONFIG["tokenizer_path"])
+            logging.info(f"Tokenizer treinado com {len(self.tokenizer.vocab)} tokens e salvo.")
+        print(Fore.GREEN + f"Tokenizer pronto com {MODEL_PARAMS['vocab_size']} tokens.")
+
+    def _load_checkpoint(self):
+        if os.path.exists(CONFIG["latest_model_path"]):
+            logging.info(f"Resumindo treinamento a partir de '{CONFIG['latest_model_path']}'")
+            print(Fore.YELLOW + f"Resumindo treinamento a partir do último checkpoint...")
+            checkpoint = torch.load(CONFIG["latest_model_path"])
+            self.model.load_state_dict(checkpoint['model_state'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+            self.start_epoch = checkpoint['epoch'] + 1
+            self.progress = checkpoint.get('progress', self.progress)
+            self.scaler.load_state_dict(checkpoint['scaler_state'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+            logging.info(f"Treinamento será retomado da época {self.start_epoch}")
+        elif os.path.exists(CONFIG["best_model_path"]):
+             logging.info(f"Iniciando com os pesos do melhor modelo anterior de '{CONFIG['best_model_path']}'")
+             print(Fore.YELLOW + f"Iniciando com os pesos do melhor modelo anterior...")
+             self.model.load_state_dict(torch.load(CONFIG['best_model_path'])['model_state'])
+
+    def _save_checkpoint(self, epoch, is_best):
+        state = {
+            'epoch': epoch,
+            'model_state': self.model.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'scaler_state': self.scaler.state_dict(),
+            'scheduler_state': self.scheduler.state_dict(),
+            'progress': self.progress
+        }
+        torch.save(state, CONFIG["latest_model_path"])
+        if is_best:
+            logging.info(f"Salvando novo melhor modelo em '{CONFIG['best_model_path']}'")
+            shutil.copyfile(CONFIG["latest_model_path"], CONFIG["best_model_path"])
+
+    def _generate_text(self, prompt, max_gen_len=50, method='nucleus', temp=1.0):
+        self.model.eval()
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)[:-1] # Remove </s>
+        input_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        
+        generated_ids = list(prompt_ids)
+        with torch.no_grad():
+            for _ in range(max_gen_len):
+                padding_mask = (input_tensor == self.tokenizer.pad_id)
+                with autocast(enabled=(self.device.type == 'cuda')):
+                    output = self.model(input_tensor, src_key_padding_mask=padding_mask)
+                
+                next_token_logits = output[:, -1, :]
+                
+                if method == 'nucleus':
+                    # --- NUCLEUS SAMPLING (TOP-P) ---
+                    scaled_logits = next_token_logits / temp
+                    probs = torch.softmax(scaled_logits, dim=-1)
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    
+                    sorted_indices_to_remove = cumulative_probs > GENERATION_PARAMS['top_p']
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                    next_token_logits[:, indices_to_remove] = -float('Inf')
+                    
+                    next_token_probs = torch.softmax(next_token_logits, dim=-1)
+                    next_token_id = torch.multinomial(next_token_probs, num_samples=1).item()
+
+                else: # GREEDY (DEFAULT)
+                    next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+
+                if next_token_id == self.tokenizer.eos_id: break
+                
+                generated_ids.append(next_token_id)
+                next_input = torch.tensor([[next_token_id]], dtype=torch.long, device=self.device)
+                input_tensor = torch.cat([input_tensor, next_input], dim=1)
+                
+                if input_tensor.size(1) > TRAINING_PARAMS["max_length"] - 1:
+                    input_tensor = input_tensor[:, 1:]
+
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    def _run_epoch_autotest(self, epoch):
+        logging.info(f"--- Iniciando autoteste para a Época {epoch + 1} ---")
+        results = {}
+        # Gera com métodos diferentes para comparação
+        for i, prompt in enumerate(AUTOTEST_PROMPTS):
+            method = 'nucleus' if i % 2 == 0 else 'greedy'
+            generated_text = self._generate_text(prompt, max_gen_len=60, method=method)
+            results[prompt] = f"({method}) {generated_text}"
+            logging.info(f"Prompt: '{prompt}' -> ({method}) '{generated_text}'")
+        logging.info(f"--- Fim do autoteste da Época {epoch + 1} ---")
+        return results
+
+    def _save_progress(self):
+        os.makedirs(os.path.dirname(CONFIG["progress_path"]), exist_ok=True)
+        with open(CONFIG["progress_path"], 'w', encoding='utf-8') as f:
+            json.dump(self.progress, f, ensure_ascii=False, indent=4)
+
+    def train_loop(self):
+        logging.info("Iniciando o loop de treinamento avançado...")
+        dataset = TextDataset(CONFIG["corpus_path"], self.tokenizer, TRAINING_PARAMS["max_length"])
+        if len(dataset) == 0:
+            logging.error("O dataset está vazio. Verifique o corpus e max_length.")
+            return
+
+        dataloader = DataLoader(dataset, batch_size=TRAINING_PARAMS["batch_size"], shuffle=True, 
+                                num_workers=min(4, os.cpu_count()), pin_memory=self.device.type=='cuda')
+
+        for epoch in range(self.start_epoch, TRAINING_PARAMS["epochs"]):
+            self.model.train()
+            total_loss = 0
+            
+            progress_bar = tqdm(dataloader, desc=f"Época {epoch + 1}/{TRAINING_PARAMS['epochs']}", leave=False, colour="cyan")
+            self.optimizer.zero_grad() # Limpar gradientes no início da época
+            
+            for i, (src, tgt) in enumerate(progress_bar):
+                src, tgt = src.to(self.device), tgt.to(self.device)
+                src_padding_mask = (src == self.tokenizer.pad_id)
+
+                with autocast(enabled=(self.device.type == 'cuda')):
+                    output = self.model(src, src_key_padding_mask=src_padding_mask)
+                    loss = self.criterion(output.view(-1, MODEL_PARAMS["vocab_size"]), tgt.view(-1))
+                    loss = loss / TRAINING_PARAMS["gradient_accumulation_steps"] # Normalizar a loss
+
+                self.scaler.scale(loss).backward() # Acumular gradientes
+
+                if (i + 1) % TRAINING_PARAMS["gradient_accumulation_steps"] == 0:
+                    self.scaler.unscale_(self.optimizer) # Unscale antes de clipar
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), TRAINING_PARAMS["clip_grad_norm"])
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+
+                total_loss += loss.item() * TRAINING_PARAMS["gradient_accumulation_steps"]
+                progress_bar.set_postfix(loss=loss.item() * TRAINING_PARAMS["gradient_accumulation_steps"], lr=self.optimizer.param_groups[0]['lr'])
+
+            avg_loss = total_loss / len(dataloader)
+            perplexity = math.exp(avg_loss) if avg_loss < 100 else float('inf')
+            
+            self.scheduler.step(avg_loss) # Atualizar o agendador de LR
+            self.progress['current_lr'] = self.optimizer.param_groups[0]['lr']
+
+            logging.info(f"Fim da Época {epoch + 1}: Loss Médio = {avg_loss:.4f}, Perplexity = {perplexity:.4f}, LR = {self.progress['current_lr']:.6f}")
+            print(Style.BRIGHT + Fore.MAGENTA + f"Época {epoch + 1} concluída. Loss: {avg_loss:.4f} | Perplexity: {perplexity:.4f}")
+
+            is_best = perplexity < self.progress["best_perplexity"]
+            if is_best:
+                self.progress["best_perplexity"] = perplexity
+                logging.info(f"Nova melhor perplexidade alcançada: {perplexity:.4f}")
+
+            autotest_results = self._run_epoch_autotest(epoch)
+            epoch_data = {
+                "epoch": epoch + 1, "avg_loss": avg_loss, "perplexity": perplexity,
+                "checkpoint_path": CONFIG['latest_model_path'], "autotest_results": autotest_results
+            }
+            # Remove a epoca anterior se ela já existir no progresso (em caso de resumo)
+            self.progress["epochs"] = [e for e in self.progress["epochs"] if e['epoch'] != epoch + 1]
+            self.progress["epochs"].append(epoch_data)
+
+            self._save_checkpoint(epoch, is_best)
+            self._save_progress()
+
+        logging.info("Treinamento concluído.")
+        print(Fore.GREEN + Style.BRIGHT + "Treinamento concluído com sucesso!")
+        return self.progress["best_perplexity"]
+
+# ==============================================================================
+#      AVALIAÇÃO FINAL, DEPLOYMENT E INFERÊNCIA (versão aprimorada) :trophy:
+# ==============================================================================
+class PostTrainingManager:
+    def __init__(self, final_perplexity):
+        self.final_perplexity = final_perplexity
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.logger = logging.getLogger()
+
+    def _get_previous_best_metric(self):
+        backup_files = [f for f in os.listdir(CONFIG["backups_dir"]) if f.startswith("melhor_") and f.endswith(".json")]
+        if not backup_files:
+            self.logger.info("Nenhum backup de modelo anterior encontrado.")
+            return float('inf')
+        
+        latest_backup = sorted(backup_files, reverse=True)[0]
+        try:
+            with open(os.path.join(CONFIG["backups_dir"], latest_backup), 'r') as f:
+                data = json.load(f)
+                # Compatibilidade com a métrica antiga (loss) e nova (perplexity)
+                metric = data.get('best_perplexity', data.get('best_loss', float('inf')))
+                self.logger.info(f"Métrica do melhor modelo anterior ('{latest_backup}') é: {metric:.4f}")
+                return metric
+        except Exception as e:
+            self.logger.error(f"Não foi possível ler o arquivo de backup '{latest_backup}': {e}")
+            return float('inf')
+
+    def evaluate_and_deploy(self):
+        self.logger.info("Iniciando autoavaliação final...")
+        previous_best = self._get_previous_best_metric()
+
+        if self.final_perplexity < previous_best:
+            self.logger.info(f"NOVO MELHOR MODELO! Perplexity atual ({self.final_perplexity:.4f}) < Anterior ({previous_best:.4f}).")
+            print(Fore.GREEN + Style.BRIGHT + "NOVO MELHOR MODELO! O script será atualizado.")
+
+            best_model_info = {
+                "timestamp": self.timestamp,
+                "best_perplexity": self.final_perplexity,
+                "script_version": "PythonGenerativa5.py",
+                "model_params": MODEL_PARAMS, "training_params": TRAINING_PARAMS
+            }
+            backup_filename = os.path.join(CONFIG["backups_dir"], f"melhor_{self.timestamp}.json")
+            with open(backup_filename, 'w', encoding='utf-8') as f: json.dump(best_model_info, f, indent=4)
+            self.logger.info(f"Informações do novo melhor modelo salvas em: {backup_filename}")
+
+            if os.path.exists(CONFIG["old_script_path"]):
+                backup_script_path = os.path.join(CONFIG["backups_dir"], f"PythonGenerativa2_backup_{self.timestamp}.py")
+                shutil.copy2(CONFIG["old_script_path"], backup_script_path)
+                self.logger.info(f"Backup do script antigo '{CONFIG['old_script_path']}' feito.")
+
+            try:
+                shutil.copy2(CONFIG["current_script_path"], CONFIG["old_script_path"])
+                self.logger.info(f"Script '{CONFIG['old_script_path']}' foi substituído por '{os.path.basename(CONFIG['current_script_path'])}'.")
+                print(Fore.GREEN + f"Script '{CONFIG['old_script_path']}' atualizado.")
+            except Exception as e:
+                self.logger.error(f"Falha ao substituir o script base: {e}")
+                print(Fore.RED + f"Falha ao substituir o script base: {e}")
+        else:
+            self.logger.warning(f"O modelo treinado (Perplexity: {self.final_perplexity:.4f}) não superou o melhor anterior ({previous_best:.4f}).")
+            print(Fore.YELLOW + "O modelo treinado não superou a versão anterior. O script base não foi modificado.")
+
+    def run_final_inference(self, engine):
+        self.logger.info("Executando inferência final com o melhor modelo...")
+        if os.path.exists(CONFIG["best_model_path"]):
+            engine.model.load_state_dict(torch.load(CONFIG["best_model_path"])['model_state'])
+            self.logger.info(f"Pesos do melhor modelo carregados de '{CONFIG['best_model_path']}' para inferência.")
+        else:
+            self.logger.warning("Checkpoint do melhor modelo não encontrado. Usando o modelo em memória.")
+
+        response = engine._generate_text(FINAL_INFERENCE_PROMPT, max_gen_len=150, method='nucleus', temp=0.9)
+        
+        inference_content = (
+            f"--- INFERÊNCIA AUTOMÁTICA ---\n"
+            f"Timestamp: {self.timestamp}\n"
+            f"Modelo: {CONFIG['best_model_path']}\n"
+            f"Final Perplexity: {self.final_perplexity:.4f}\n\n"
+            f"PROMPT:\n{FINAL_INFERENCE_PROMPT}\n\n"
+            f"RESPOSTA GERADA (Nucleus Sampling):\n{response}\n"
+        )
+        
+        inference_filename = os.path.join(CONFIG["inference_dir"], f"inferencia_{self.timestamp}.txt")
+        with open(inference_filename, 'w', encoding='utf-8') as f: f.write(inference_content)
+        
+        self.logger.info(f"Inferência final salva em: {inference_filename}")
+        print(Fore.CYAN + f"\n--- INFERÊNCIA FINAL ---")
+        print(f"{Fore.WHITE}Prompt: {FINAL_INFERENCE_PROMPT}")
+        print(f"{Fore.CYAN}Resposta: {response}")
+        print(f"Resultado salvo em: {inference_filename}")
+
+# ==============================================================================
+#                 ORQUESTRADOR PRINCIPAL E EXECUÇÃO (Main)
+# ==============================================================================
+class Orchestrator:
+    def __init__(self):
+        self.start_time = datetime.now()
+        print(Fore.CYAN + Style.BRIGHT + "===== INICIANDO PYTHON GENERATIVA 5.0 (ENHANCED) =====")
+        print(f"Data e Hora: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def _create_directories(self):
+        print("Verificando estrutura de diretórios...")
+        for key, path in CONFIG.items():
+            if 'dir' in key:
+                os.makedirs(path, exist_ok=True)
+                print(f"  - Diretório '{path}' OK.")
+        
+        if not os.path.exists(CONFIG["corpus_path"]):
+            print(Fore.YELLOW + f"Aviso: Corpus '{CONFIG['corpus_path']}' não encontrado.")
+            os.makedirs(os.path.dirname(CONFIG["corpus_path"]), exist_ok=True)
+            with open(CONFIG["corpus_path"], 'w', encoding='utf-8') as f:
+                f.write(
+                    "Inteligência artificial é a simulação de processos de inteligência humana por máquinas. "
+                    "Aprendizado de máquina é um campo da inteligência artificial. "
+                    "Redes neurais são um subconjunto do aprendizado de máquina. "
+                    "LLMs, ou Large Language Models, são modelos de linguagem grandes treinados com muitos dados. "
+                    "Os dados são o combustível da inteligência artificial moderna. "
+                    "Python é uma linguagem de programação popular para ciência de dados e aprendizado de máquina."
+                )
+            print(Fore.GREEN + "Um arquivo de corpus de exemplo foi criado para demonstração.")
+
+    def run(self):
+        try:
+            self._create_directories()
+            engine = TrainingEngine()
+            final_metric = engine.train_loop()
+
+            if final_metric is not None:
+                post_manager = PostTrainingManager(final_metric)
+                post_manager.evaluate_and_deploy()
+                post_manager.run_final_inference(engine)
+            else:
+                logging.error("O treinamento não foi concluído. Etapas pós-treinamento ignoradas.")
+        except Exception as e:
+            logging.critical(f"Uma exceção não tratada encerrou o script: {e}", exc_info=True)
+            print(Fore.RED + Style.BRIGHT + f"\nERRO CRÍTICO: {e}")
+            print(Fore.RED + "Verifique o arquivo 'logs/training.log' para detalhes completos.")
+        finally:
+            end_time = datetime.now()
+            duration = end_time - self.start_time
+            print(Fore.CYAN + Style.BRIGHT + "\n===== EXECUÇÃO FINALIZADA =====")
+            print(f"Tempo total de execução: {str(duration).split('.')[0]}")
+
+
+if __name__ == "__main__":
+    orchestrator = Orchestrator()
+    orchestrator.run()
